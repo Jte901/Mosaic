@@ -65,10 +65,10 @@ using namespace cv::detail;
 // vector<string> img_names;
 bool preview = false;
 bool try_gpu = false;
-double work_megapix = 0.6;
-double seam_megapix = 0.1;
+double work_megapix = 0.08;
+double seam_megapix = 0.08;
 double compose_megapix = -1;
-float conf_thresh = 1.f;
+float conf_thresh = 0.5f;
 string features_type = "surf";
 string ba_cost_func = "ray";
 string ba_refine_mask = "xxxxx";
@@ -76,10 +76,10 @@ bool do_wave_correct = true;
 WaveCorrectKind wave_correct = detail::WAVE_CORRECT_HORIZ;
 bool save_graph = false;
 std::string save_graph_to;
-string warp_type = "spherical";
-int expos_comp_type = ExposureCompensator::GAIN_BLOCKS;
+string warp_type = "cylindrical";
+int expos_comp_type = ExposureCompensator::GAIN;
 float match_conf = 0.3f;
-string seam_find_type = "gc_color";
+string seam_find_type = "dp_colorgrad";
 int blend_type = Blender::MULTI_BAND;
 float blend_strength = 5;
 string result_name = "result.jpg";
@@ -98,10 +98,9 @@ bool stitch(vector<Mat> orig_images) {
     bool is_work_scale_set = false, is_seam_scale_set = false, is_compose_scale_set = false;
 
     LOGLN("Finding features...");
-// #if ENABLE_LOG
+#if ENABLE_LOG
     int64 t = getTickCount();
-    cout << (getTickCount() - t) / getTickFrequency() << endl;
-// #endif
+#endif
 
     Ptr<FeaturesFinder> finder;
     if (features_type == "surf")
@@ -123,29 +122,25 @@ bool stitch(vector<Mat> orig_images) {
         return -1;
     }
 
+    Mat full_img, img;
     vector<ImageFeatures> features(num_images);
     vector<Mat> images(num_images);
     vector<Size> full_img_sizes(num_images);
     double seam_work_aspect = 1;
 
-    vector<Mat> full_img(num_images);
-    vector<Mat> img(num_images);
-
-
-    #pragma omp parallel for
     for (int i = 0; i < num_images; ++i)
     {
-        full_img[i] = orig_images[i];
-        full_img_sizes[i] = full_img[i].size();
+        full_img = orig_images[i];
+        full_img_sizes[i] = full_img.size();
 
-        // if (full_img[i].empty())
-        // {
-        //     // LOGLN("Can't open image " << img_names[i]);
-        //     return -1;
-        // }
+        if (full_img.empty())
+        {
+            // LOGLN("Can't open image " << img_names[i]);
+            return -1;
+        }
         if (work_megapix < 0)
         {
-            img[i] = full_img[i];
+            img = full_img;
             work_scale = 1;
             is_work_scale_set = true;
         }
@@ -153,34 +148,31 @@ bool stitch(vector<Mat> orig_images) {
         {
             if (!is_work_scale_set)
             {
-                work_scale = min(1.0, sqrt(work_megapix * 1e6 / full_img[i].size().area()));
+                work_scale = min(1.0, sqrt(work_megapix * 1e6 / full_img.size().area()));
                 is_work_scale_set = true;
             }
-            resize(full_img[i], img[i], Size(), work_scale, work_scale);
+            resize(full_img, img, Size(), work_scale, work_scale);
         }
         if (!is_seam_scale_set)
         {
-            seam_scale = min(1.0, sqrt(seam_megapix * 1e6 / full_img[i].size().area()));
+            seam_scale = min(1.0, sqrt(seam_megapix * 1e6 / full_img.size().area()));
             seam_work_aspect = seam_scale / work_scale;
             is_seam_scale_set = true;
         }
 
-        (*finder)(img[i], features[i]);
+        (*finder)(img, features[i]);
         features[i].img_idx = i;
         LOGLN("Features in image #" << i+1 << ": " << features[i].keypoints.size());
 
-        resize(full_img[i], img[i], Size(), seam_scale, seam_scale);
-        images[i] = img[i].clone();
+        resize(full_img, img, Size(), seam_scale, seam_scale);
+        images[i] = img.clone();
     }
 
     finder->collectGarbage();
-    // full_img.release();
-    // img.release();
+    full_img.release();
+    img.release();
 
     LOGLN("Finding features, time: " << ((getTickCount() - t) / getTickFrequency()) << " sec");
-
-    cout << (getTickCount() - t) / getTickFrequency() << endl;
-    return true;
 
     LOG("Pairwise matching");
 #if ENABLE_LOG
@@ -188,8 +180,14 @@ bool stitch(vector<Mat> orig_images) {
 #endif
     vector<MatchesInfo> pairwise_matches;
     BestOf2NearestMatcher matcher(try_gpu, match_conf);
-    matcher(features, pairwise_matches);
+    Mat matchMask(features.size(),features.size(),CV_8U,Scalar(0));
+    for (int i = 0; i < num_images -1; ++i)
+    {
+        matchMask.at<char>(i,i+1) =1;
+    }
+    matcher(features, pairwise_matches,matchMask);
     matcher.collectGarbage();
+
     LOGLN("Pairwise matching, time: " << ((getTickCount() - t) / getTickFrequency()) << " sec");
 
     // Check if we should save matches graph
@@ -414,11 +412,11 @@ bool stitch(vector<Mat> orig_images) {
         LOGLN("Compositing image #" << indices[img_idx]+1);
 
         // Read image and resize it if necessary
-        // full_img = untouched_images[img_idx];
+        full_img = untouched_images[img_idx];
         if (!is_compose_scale_set)
         {
             if (compose_megapix > 0)
-                compose_scale = min(1.0, sqrt(compose_megapix * 1e6 / full_img[img_idx].size().area()));
+                compose_scale = min(1.0, sqrt(compose_megapix * 1e6 / full_img.size().area()));
             is_compose_scale_set = true;
 
             // Compute relative scales
@@ -453,17 +451,17 @@ bool stitch(vector<Mat> orig_images) {
             }
         }
         if (abs(compose_scale - 1) > 1e-1)
-            resize(full_img[img_idx], img, Size(), compose_scale, compose_scale);
+            resize(full_img, img, Size(), compose_scale, compose_scale);
         else
-            img[img_idx] = full_img[img_idx];
-        full_img[img_idx].release();
-        Size img_size = img[img_idx].size();
+            img = full_img;
+        full_img.release();
+        Size img_size = img.size();
 
         Mat K;
         cameras[img_idx].K().convertTo(K, CV_32F);
 
         // Warp the current image
-        warper->warp(img[img_idx], K, cameras[img_idx].R, INTER_LINEAR, BORDER_REFLECT, img_warped);
+        warper->warp(img, K, cameras[img_idx].R, INTER_LINEAR, BORDER_REFLECT, img_warped);
 
         // Warp the current image mask
         mask.create(img_size, CV_8U);
@@ -475,7 +473,7 @@ bool stitch(vector<Mat> orig_images) {
 
         img_warped.convertTo(img_warped_s, CV_16S);
         img_warped.release();
-        img[img_idx].release();
+        img.release();
         mask.release();
 
         dilate(masks_warped[img_idx], dilated_mask, Mat());
